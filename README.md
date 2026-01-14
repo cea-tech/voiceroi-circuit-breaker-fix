@@ -1,109 +1,89 @@
 # VoiceROI Circuit Breaker Fix
 
-## 🚨 CRITICAL BUG IDENTIFIED
+## 🎯 THE BUG (Read This First!)
 
-The embedding circuit breakers (`embedding_breaker`, `openai_breaker`) show **0 calls** after queries because the query path bypasses the breaker-wrapped functions.
+**Symptom:** After 10+ queries, metrics show:
+```
+circuit_breaker_calls_total{name="embedding"} 0    ← BUG! Should be > 0
+circuit_breaker_calls_total{name="redis"} 15       ← Works fine
+```
 
-**Evidence:** After 10+ queries: `circuit_breaker_calls_total{name="embedding"} 0`
+**Root Cause:** The **primary embedding path** bypasses `embedding_breaker`. 
+
+The fallback in `get_embedding()` (line ~845) uses `embed_text()` correctly, BUT:
+- `SemanticEmbeddingCache` or the primary path calls OpenAI **directly**
+- This direct call doesn't go through `embedding_breaker`
 
 ---
 
-## 📦 This Package Contains
+## 🔍 CLAUDE CODE: Diagnostic Steps
 
-| File | Purpose |
-|------|---------|
-| `CLAUDE_CODE_EXECUTE_STEPS.md` | Step-by-step execution guide with copy-paste commands |
-| `CLAUDE_CODE_CIRCUIT_BREAKER_FIX.md` | Detailed implementation reference |
-| `CLAUDE_EXECUTE_NOW.py` | Python automation script (optional) |
-
----
-
-## 🚀 CLAUDE CODE: Quick Start
-
-### Step 1: Clone this repo
+### Step 1: Confirm the bug exists
 ```bash
-cd /Users/michaelweiss
-git clone https://github.com/cea-tech/voiceroi-circuit-breaker-fix.git
-cd voiceroi-circuit-breaker-fix
+curl -s https://voiceroi-rag-api.fly.dev/metrics | grep -E "circuit.*calls.*total"
 ```
 
-### Step 2: Read the execution guide
-```bash
-cat CLAUDE_CODE_EXECUTE_STEPS.md
-```
+If `embedding` shows 0, the bug is confirmed.
 
-### Step 3: Execute the fix
-The main fix is in `app/main.py` - change `get_embedding()` to use `embed_text` from `infra.py`:
-
-**FIND:**
-```python
-async def get_embedding(text: str) -> list[float]:
-    resp = await openai_client.embeddings.create(
-        input=text,
-        model="text-embedding-3-small",
-    )
-    return resp.data[0].embedding
-```
-
-**REPLACE WITH:**
-```python
-async def get_embedding(text: str) -> list[float]:
-    """Routes through circuit-breaker-protected embed_text."""
-    from app.services.infra import embed_text
-    return await embed_text(text)
-```
-
-### Step 4: Update version and deploy
+### Step 2: Find ALL direct OpenAI embedding calls
 ```bash
 cd "/Users/michaelweiss/RAG API/voiceroi-rag-api"
-# Update APP_VERSION to "1.0.6-circuit-breakers-fixed" in app/main.py
-fly deploy --now
+grep -rn "embeddings.create" app/
 ```
 
-### Step 5: Verify fix worked
+**You should find calls in:**
+- `app/services/infra.py` - This is CORRECT (breaker-wrapped)
+- Anywhere else - This is the BUG (bypasses breaker)
+
+### Step 3: Check get_embedding() primary path
 ```bash
-# Send test queries
-for i in 1 2 3 4 5; do
-  curl -s -X POST "https://voiceroi-rag-api.fly.dev/query" \
-    -H "Content-Type: application/json" \
-    -H "x-api-key: -qTH30qS0b8iCQDlEUGlFYFybNxXwY5Vd7tBbj4jV7M" \
-    -d '{"question": "Test query '$RANDOM' about VoiceROI"}' > /dev/null
-done
-
-# Check metrics - MUST show embedding calls > 0
-curl -s https://voiceroi-rag-api.fly.dev/metrics | grep "calls_total"
+grep -n -A 30 "async def get_embedding" app/main.py
 ```
+
+Look for code like:
+```python
+if semantic_cache:
+    cached = await semantic_cache.get(text)  # Does THIS call OpenAI directly?
+```
+
+### Step 4: Check SemanticEmbeddingCache
+```bash
+grep -rn "class SemanticEmbeddingCache" app/
+# Then read that file
+```
+
+---
+
+## 🔧 THE FIX
+
+**Every** place that does this:
+```python
+response = await openai_client.embeddings.create(input=text, model="...")
+```
+
+Must instead do this:
+```python
+from app.services.infra import embed_text
+embedding = await embed_text(text)
+```
+
+This ensures ALL embedding calls go through `embedding_breaker`.
+
+---
+
+## 📦 Files in This Repo
+
+| File | Description |
+|------|-------------|
+| `CLAUDE_CODE_CLARIFICATION.md` | **READ THIS FIRST** - Explains the actual bug |
+| `CLAUDE_CODE_EXECUTE_STEPS.md` | Step-by-step fix guide |
+| `CLAUDE_CODE_CIRCUIT_BREAKER_FIX.md` | Full implementation details |
 
 ---
 
 ## ✅ Success Criteria
 
-**BEFORE (BUG):**
+After fix + deploy:
 ```
-circuit_breaker_calls_total{name="embedding"} 0
-circuit_breaker_calls_total{name="redis"} 11
-```
-
-**AFTER (FIXED):**
-```
-circuit_breaker_calls_total{name="embedding"} 5  ← MUST BE > 0
-circuit_breaker_calls_total{name="redis"} 16
-```
-
----
-
-## 📂 Target Files
-
-- `/Users/michaelweiss/RAG API/voiceroi-rag-api/app/main.py` - Fix `get_embedding()`
-- `/Users/michaelweiss/RAG API/voiceroi-rag-api/app/services/infra.py` - Canonical `embed_text()`
-- `/Users/michaelweiss/RAG API/voiceroi-rag-api/app/middleware/circuit_breaker.py` - Breaker implementation
-
----
-
-## 🔄 Rollback (if needed)
-
-```bash
-cd "/Users/michaelweiss/RAG API/voiceroi-rag-api"
-git checkout app/main.py app/services/infra.py
-fly deploy --now
+circuit_breaker_calls_total{name="embedding"} > 0  ← FIXED!
 ```
